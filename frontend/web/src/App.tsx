@@ -1,41 +1,53 @@
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import '@rainbow-me/rainbowkit/styles.css';
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { getContractReadOnly, getContractWithSigner } from "./components/useContract";
 import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
+import { ethers } from 'ethers';
 
-interface ChessMove {
+interface ChessData {
   id: string;
-  from: string;
-  to: string;
-  piece: string;
-  encryptedValue: string;
-  timestamp: number;
+  name: string;
+  encryptedPosition: string;
+  publicValue1: number;
+  publicValue2: number;
+  description: string;
   creator: string;
-  isVerified: boolean;
+  timestamp: number;
   decryptedValue: number;
+  isVerified: boolean;
+}
+
+interface ChessPiece {
+  id: string;
+  type: string;
+  position: number;
+  isEncrypted: boolean;
 }
 
 const App: React.FC = () => {
   const { address, isConnected } = useAccount();
   const [loading, setLoading] = useState(true);
-  const [moves, setMoves] = useState<ChessMove[]>([]);
-  const [showMoveModal, setShowMoveModal] = useState(false);
-  const [makingMove, setMakingMove] = useState(false);
+  const [chessData, setChessData] = useState<ChessData[]>([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [creatingPiece, setCreatingPiece] = useState(false);
   const [transactionStatus, setTransactionStatus] = useState<{ visible: boolean; status: "pending" | "success" | "error"; message: string; }>({ 
     visible: false, 
     status: "pending", 
     message: "" 
   });
-  const [newMoveData, setNewMoveData] = useState({ from: "", to: "", piece: "pawn" });
-  const [selectedMove, setSelectedMove] = useState<ChessMove | null>(null);
+  const [newPieceData, setNewPieceData] = useState({ name: "", position: "", description: "" });
+  const [selectedPiece, setSelectedPiece] = useState<ChessData | null>(null);
+  const [decryptedPosition, setDecryptedPosition] = useState<number | null>(null);
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [contractAddress, setContractAddress] = useState("");
   const [fhevmInitializing, setFhevmInitializing] = useState(false);
-  const [boardVisibility, setBoardVisibility] = useState<Record<string, boolean>>({});
-  const [radarData, setRadarData] = useState<number[][]>([]);
+  const [activeTab, setActiveTab] = useState("board");
+  const [history, setHistory] = useState<string[]>([]);
+  const [faqOpen, setFaqOpen] = useState<number | null>(null);
 
   const { status, initialize, isInitialized } = useFhevm();
   const { encrypt, isEncrypting } = useEncrypt();
@@ -44,16 +56,22 @@ const App: React.FC = () => {
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
       if (!isConnected || isInitialized || fhevmInitializing) return;
+      
       try {
         setFhevmInitializing(true);
         await initialize();
       } catch (error) {
-        setTransactionStatus({ visible: true, status: "error", message: "FHEVM initialization failed" });
+        setTransactionStatus({ 
+          visible: true, 
+          status: "error", 
+          message: "FHEVM initialization failed" 
+        });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       } finally {
         setFhevmInitializing(false);
       }
     };
+
     initFhevmAfterConnection();
   }, [isConnected, isInitialized, initialize, fhevmInitializing]);
 
@@ -63,8 +81,9 @@ const App: React.FC = () => {
         setLoading(false);
         return;
       }
+      
       try {
-        await loadMoves();
+        await loadData();
         const contract = await getContractReadOnly();
         if (contract) setContractAddress(await contract.getAddress());
       } catch (error) {
@@ -73,150 +92,157 @@ const App: React.FC = () => {
         setLoading(false);
       }
     };
+
     loadDataAndContract();
   }, [isConnected]);
 
-  const loadMoves = async () => {
+  const loadData = async () => {
     if (!isConnected) return;
+    
+    setIsRefreshing(true);
     try {
       const contract = await getContractReadOnly();
       if (!contract) return;
+      
       const businessIds = await contract.getAllBusinessIds();
-      const movesList: ChessMove[] = [];
+      const dataList: ChessData[] = [];
+      
       for (const businessId of businessIds) {
         try {
-          const moveData = await contract.getBusinessData(businessId);
-          movesList.push({
+          const data = await contract.getBusinessData(businessId);
+          dataList.push({
             id: businessId,
-            from: moveData.name,
-            to: moveData.description,
-            piece: "pawn",
-            encryptedValue: businessId,
-            timestamp: Number(moveData.timestamp),
-            creator: moveData.creator,
-            isVerified: moveData.isVerified,
-            decryptedValue: Number(moveData.decryptedValue) || 0
+            name: data.name,
+            encryptedPosition: businessId,
+            publicValue1: Number(data.publicValue1) || 0,
+            publicValue2: Number(data.publicValue2) || 0,
+            description: data.description,
+            creator: data.creator,
+            timestamp: Number(data.timestamp),
+            decryptedValue: Number(data.decryptedValue) || 0,
+            isVerified: data.isVerified
           });
         } catch (e) {
-          console.error('Error loading move data:', e);
+          console.error('Error loading data:', e);
         }
       }
-      setMoves(movesList);
-      updateBoardVisibility(movesList);
-      generateRadarData(movesList);
+      
+      setChessData(dataList);
+      addHistory("Loaded encrypted chess data");
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Failed to load moves" });
+      setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
+    } finally { 
+      setIsRefreshing(false); 
     }
   };
 
-  const updateBoardVisibility = (movesList: ChessMove[]) => {
-    const visibility: Record<string, boolean> = {};
-    const positions = new Set<string>();
-    movesList.forEach(move => {
-      positions.add(move.from);
-      positions.add(move.to);
-    });
-    positions.forEach(pos => {
-      visibility[pos] = Math.random() > 0.5;
-    });
-    setBoardVisibility(visibility);
-  };
-
-  const generateRadarData = (movesList: ChessMove[]) => {
-    const data: number[][] = [];
-    movesList.forEach(move => {
-      data.push([
-        Math.floor(Math.random() * 10),
-        Math.floor(Math.random() * 10),
-        Math.floor(Math.random() * 10),
-        Math.floor(Math.random() * 10),
-        Math.floor(Math.random() * 10)
-      ]);
-    });
-    setRadarData(data);
-  };
-
-  const makeMove = async () => {
+  const createPiece = async () => {
     if (!isConnected || !address) { 
-      setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
+      setTransactionStatus({ visible: true, status: "error", message: "Connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return; 
     }
-    setMakingMove(true);
-    setTransactionStatus({ visible: true, status: "pending", message: "Making encrypted move..." });
+    
+    setCreatingPiece(true);
+    setTransactionStatus({ visible: true, status: "pending", message: "Creating piece with FHE..." });
+    
     try {
       const contract = await getContractWithSigner();
-      if (!contract) throw new Error("Failed to get contract with signer");
-      const moveValue = Math.floor(Math.random() * 100);
-      const moveId = `move-${Date.now()}`;
-      const encryptedResult = await encrypt(contractAddress, address, moveValue);
+      if (!contract) throw new Error("Failed to get contract");
+      
+      const positionValue = parseInt(newPieceData.position) || 0;
+      const businessId = `piece-${Date.now()}`;
+      
+      const encryptedResult = await encrypt(contractAddress, address, positionValue);
+      
       const tx = await contract.createBusinessData(
-        moveId,
-        newMoveData.from,
+        businessId,
+        newPieceData.name,
         encryptedResult.encryptedData,
         encryptedResult.proof,
         0,
         0,
-        newMoveData.to
+        newPieceData.description
       );
+      
       setTransactionStatus({ visible: true, status: "pending", message: "Waiting for confirmation..." });
       await tx.wait();
-      setTransactionStatus({ visible: true, status: "success", message: "Move made successfully!" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-      await loadMoves();
-      setShowMoveModal(false);
-      setNewMoveData({ from: "", to: "", piece: "pawn" });
+      
+      setTransactionStatus({ visible: true, status: "success", message: "Piece created!" });
+      setTimeout(() => {
+        setTransactionStatus({ visible: false, status: "pending", message: "" });
+      }, 2000);
+      
+      await loadData();
+      setShowCreateModal(false);
+      setNewPieceData({ name: "", position: "", description: "" });
+      addHistory(`Created encrypted piece: ${newPieceData.name}`);
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
         ? "Transaction rejected" 
-        : "Move failed: " + (e.message || "Unknown error");
+        : "Creation failed: " + (e.message || "Unknown error");
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
-      setMakingMove(false); 
+      setCreatingPiece(false); 
     }
   };
 
-  const decryptMove = async (moveId: string): Promise<number | null> => {
+  const decryptData = async (businessId: string): Promise<number | null> => {
     if (!isConnected || !address) { 
-      setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
+      setTransactionStatus({ visible: true, status: "error", message: "Connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
     }
+    
     setIsDecrypting(true);
     try {
       const contractRead = await getContractReadOnly();
       if (!contractRead) return null;
-      const moveData = await contractRead.getBusinessData(moveId);
-      if (moveData.isVerified) {
-        const storedValue = Number(moveData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "Move already verified" });
+      
+      const data = await contractRead.getBusinessData(businessId);
+      if (data.isVerified) {
+        const storedValue = Number(data.decryptedValue) || 0;
+        setDecryptedPosition(storedValue);
+        setTransactionStatus({ visible: true, status: "success", message: "Position verified" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
         return storedValue;
       }
+      
       const contractWrite = await getContractWithSigner();
       if (!contractWrite) return null;
-      const encryptedValueHandle = await contractRead.getEncryptedValue(moveId);
+      
+      const encryptedValueHandle = await contractRead.getEncryptedValue(businessId);
+      
       const result = await verifyDecryption(
         [encryptedValueHandle],
         contractAddress,
         (abiEncodedClearValues: string, decryptionProof: string) => 
-          contractWrite.verifyDecryption(moveId, abiEncodedClearValues, decryptionProof)
+          contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
       );
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying move..." });
+      
+      setTransactionStatus({ visible: true, status: "pending", message: "Verifying position..." });
+      
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
-      await loadMoves();
-      setTransactionStatus({ visible: true, status: "success", message: "Move verified!" });
+      const position = Number(clearValue);
+      setDecryptedPosition(position);
+      
+      await loadData();
+      
+      setTransactionStatus({ visible: true, status: "success", message: "Position decrypted!" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-      return Number(clearValue);
+      addHistory(`Decrypted position: ${position}`);
+      return position;
+      
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "Move already verified" });
+        setTransactionStatus({ visible: true, status: "success", message: "Position verified" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-        await loadMoves();
+        await loadData();
         return null;
       }
+      
       setTransactionStatus({ visible: true, status: "error", message: "Decryption failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
@@ -225,76 +251,116 @@ const App: React.FC = () => {
     }
   };
 
-  const checkAvailability = async () => {
-    try {
-      const contract = await getContractReadOnly();
-      if (!contract) return;
-      const available = await contract.isAvailable();
-      if (available) {
-        setTransactionStatus({ visible: true, status: "success", message: "System available!" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-      }
-    } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Check failed" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
-    }
-  };
-
   const renderChessBoard = () => {
-    const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
-    const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'];
+    const boardSize = 8;
+    const squares = [];
+    
+    for (let row = 0; row < boardSize; row++) {
+      for (let col = 0; col < boardSize; col++) {
+        const position = row * boardSize + col;
+        const isDark = (row + col) % 2 === 1;
+        
+        let piece = null;
+        chessData.forEach(data => {
+          if (data.isVerified && data.decryptedValue === position) {
+            piece = data.name;
+          }
+        });
+        
+        squares.push(
+          <div 
+            key={`${row}-${col}`} 
+            className={`board-square ${isDark ? "dark" : "light"} ${piece ? "has-piece" : ""}`}
+          >
+            {piece && <div className="chess-piece">{piece}</div>}
+            <div className="position-label">{position}</div>
+          </div>
+        );
+      }
+    }
+    
     return (
       <div className="chess-board">
-        {ranks.map(rank => (
-          <div key={rank} className="rank">
-            {files.map(file => {
-              const position = `${file}${rank}`;
-              const isVisible = boardVisibility[position] || false;
-              return (
-                <div 
-                  key={position} 
-                  className={`square ${(parseInt(rank) + file.charCodeAt(0) - 97) % 2 === 0 ? 'light' : 'dark'} ${isVisible ? 'visible' : 'hidden'}`}
-                  onClick={() => {
-                    if (!newMoveData.from) {
-                      setNewMoveData({...newMoveData, from: position});
-                    } else if (!newMoveData.to) {
-                      setNewMoveData({...newMoveData, to: position});
-                    }
-                  }}
-                >
-                  {newMoveData.from === position && <div className="selected-from"></div>}
-                  {newMoveData.to === position && <div className="selected-to"></div>}
-                  {isVisible ? position : '?'}
-                </div>
-              );
-            })}
-          </div>
-        ))}
+        {squares}
       </div>
     );
   };
 
-  const renderRadarChart = () => {
-    if (radarData.length === 0) return null;
+  const renderDataChart = (data: ChessData) => {
+    const position = data.isVerified ? data.decryptedValue : (decryptedPosition || 0);
+    
     return (
-      <div className="radar-chart">
-        <div className="radar-grid">
-          {[...Array(5)].map((_, i) => (
-            <div key={i} className="radar-circle" style={{ '--level': i+1 } as React.CSSProperties}></div>
-          ))}
-          {radarData.map((data, idx) => (
-            <div key={idx} className="radar-polygon" style={{ '--points': data.join(',') } as React.CSSProperties}></div>
-          ))}
+      <div className="data-chart">
+        <div className="chart-row">
+          <div className="chart-label">Position</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill" 
+              style={{ width: `${(position / 64) * 100}%` }}
+            >
+              <span className="bar-value">{position}</span>
+            </div>
+          </div>
         </div>
-        <div className="radar-labels">
-          <span>Attack</span>
-          <span>Defense</span>
-          <span>Strategy</span>
-          <span>Position</span>
-          <span>Vision</span>
+        <div className="chart-row">
+          <div className="chart-label">Verification</div>
+          <div className="chart-bar">
+            <div 
+              className="bar-fill" 
+              style={{ width: `${data.isVerified ? 100 : 0}%` }}
+            >
+              <span className="bar-value">{data.isVerified ? "Verified" : "Pending"}</span>
+            </div>
+          </div>
         </div>
       </div>
     );
+  };
+
+  const renderFHEFlow = () => {
+    return (
+      <div className="fhe-flow">
+        <div className="flow-step">
+          <div className="step-icon">1</div>
+          <div className="step-content">
+            <h4>Position Encryption</h4>
+            <p>Chess piece position encrypted with FHE 🔐</p>
+          </div>
+        </div>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">2</div>
+          <div className="step-content">
+            <h4>On-chain Storage</h4>
+            <p>Encrypted position stored on blockchain</p>
+          </div>
+        </div>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">3</div>
+          <div className="step-content">
+            <h4>Move Validation</h4>
+            <p>Homomorphic verification of move legality</p>
+          </div>
+        </div>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">4</div>
+          <div className="step-content">
+            <h4>Position Update</h4>
+            <p>New encrypted position stored</p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const addHistory = (action: string) => {
+    setHistory(prev => [action, ...prev.slice(0, 9)]);
+  };
+
+  const toggleFaq = (index: number) => {
+    setFaqOpen(faqOpen === index ? null : index);
   };
 
   if (!isConnected) {
@@ -302,25 +368,28 @@ const App: React.FC = () => {
       <div className="app-container">
         <header className="app-header">
           <div className="logo">
-            <h1>隱私迷霧象棋</h1>
-            <p>FHE-based Blind Chess</p>
+            <h1>FHE Blind Chess ♟️</h1>
           </div>
-          <div className="wallet-connect-wrapper">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          <div className="header-actions">
+            <div className="wallet-connect-wrapper">
+              <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            </div>
           </div>
         </header>
+        
         <div className="connection-prompt">
           <div className="connection-content">
-            <h2>Connect Your Wallet to Play</h2>
-            <p>Your moves will be encrypted with Zama FHE technology</p>
+            <div className="connection-icon">♟️</div>
+            <h2>Connect Wallet to Play</h2>
+            <p>Connect your wallet to start playing FHE-based Blind Chess</p>
             <div className="connection-steps">
               <div className="step">
                 <span>1</span>
-                <p>Connect your wallet</p>
+                <p>Connect wallet using button above</p>
               </div>
               <div className="step">
                 <span>2</span>
-                <p>Initialize FHE system</p>
+                <p>FHE system will initialize automatically</p>
               </div>
               <div className="step">
                 <span>3</span>
@@ -337,7 +406,7 @@ const App: React.FC = () => {
     return (
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
-        <p>Initializing FHE Chess System...</p>
+        <p>Initializing FHE Encryption...</p>
         <p>Status: {fhevmInitializing ? "Initializing FHEVM" : status}</p>
       </div>
     );
@@ -346,7 +415,7 @@ const App: React.FC = () => {
   if (loading) return (
     <div className="loading-screen">
       <div className="fhe-spinner"></div>
-      <p>Loading encrypted chess board...</p>
+      <p>Loading encrypted chess game...</p>
     </div>
   );
 
@@ -354,181 +423,210 @@ const App: React.FC = () => {
     <div className="app-container">
       <header className="app-header">
         <div className="logo">
-          <h1>隱私迷霧象棋</h1>
-          <p>FHE-based Blind Chess</p>
+          <h1>FHE Blind Chess ♟️</h1>
         </div>
+        
         <div className="header-actions">
-          <button onClick={() => setShowMoveModal(true)} className="new-move-btn">
-            New Move
-          </button>
-          <button onClick={checkAvailability} className="check-btn">
-            Check System
+          <button 
+            onClick={() => setShowCreateModal(true)} 
+            className="create-btn"
+          >
+            + New Piece
           </button>
           <div className="wallet-connect-wrapper">
             <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
           </div>
         </div>
       </header>
-
-      <div className="main-content">
-        <div className="chess-section">
-          <h2>Encrypted Chess Board</h2>
-          {renderChessBoard()}
-          <div className="board-controls">
-            <button onClick={() => setShowMoveModal(true)} className="move-btn">
-              Make Encrypted Move
-            </button>
-            <button onClick={loadMoves} className="refresh-btn">
-              Refresh Board
-            </button>
-          </div>
+      
+      <div className="main-content-container">
+        <div className="tabs">
+          <button 
+            className={`tab-btn ${activeTab === "board" ? "active" : ""}`}
+            onClick={() => setActiveTab("board")}
+          >
+            Chess Board
+          </button>
+          <button 
+            className={`tab-btn ${activeTab === "data" ? "active" : ""}`}
+            onClick={() => setActiveTab("data")}
+          >
+            Encrypted Data
+          </button>
+          <button 
+            className={`tab-btn ${activeTab === "history" ? "active" : ""}`}
+            onClick={() => setActiveTab("history")}
+          >
+            History
+          </button>
+          <button 
+            className={`tab-btn ${activeTab === "faq" ? "active" : ""}`}
+            onClick={() => setActiveTab("faq")}
+          >
+            FAQ
+          </button>
         </div>
-
-        <div className="info-section">
-          <div className="radar-section">
-            <h3>Position Radar</h3>
-            {renderRadarChart()}
+        
+        {activeTab === "board" && (
+          <div className="board-section">
+            <div className="panel metal-panel">
+              <h2>Encrypted Chess Board</h2>
+              {renderChessBoard()}
+            </div>
+            
+            <div className="panel metal-panel">
+              <h3>FHE Move Validation</h3>
+              {renderFHEFlow()}
+            </div>
           </div>
-          <div className="moves-section">
-            <h3>Move History</h3>
-            <div className="moves-list">
-              {moves.length === 0 ? (
-                <div className="no-moves">
-                  <p>No moves recorded yet</p>
-                </div>
-              ) : moves.map((move, idx) => (
-                <div 
-                  key={idx} 
-                  className={`move-item ${selectedMove?.id === move.id ? 'selected' : ''}`}
-                  onClick={() => setSelectedMove(move)}
+        )}
+        
+        {activeTab === "data" && (
+          <div className="data-section">
+            <div className="section-header">
+              <h2>Encrypted Chess Pieces</h2>
+              <div className="header-actions">
+                <button 
+                  onClick={loadData} 
+                  className="refresh-btn" 
+                  disabled={isRefreshing}
                 >
-                  <div className="move-meta">
-                    <span>{move.from} → {move.to}</span>
-                    <span>{new Date(move.timestamp * 1000).toLocaleTimeString()}</span>
+                  {isRefreshing ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+            </div>
+            
+            <div className="data-list">
+              {chessData.length === 0 ? (
+                <div className="no-data">
+                  <p>No encrypted pieces found</p>
+                  <button 
+                    className="create-btn" 
+                    onClick={() => setShowCreateModal(true)}
+                  >
+                    Create First Piece
+                  </button>
+                </div>
+              ) : chessData.map((data, index) => (
+                <div 
+                  className={`data-item ${selectedPiece?.id === data.id ? "selected" : ""} ${data.isVerified ? "verified" : ""}`} 
+                  key={index}
+                  onClick={() => setSelectedPiece(data)}
+                >
+                  <div className="data-title">{data.name}</div>
+                  <div className="data-meta">
+                    <span>Position: {data.isVerified ? data.decryptedValue : "🔒 Encrypted"}</span>
+                    <span>Created: {new Date(data.timestamp * 1000).toLocaleDateString()}</span>
                   </div>
-                  <div className="move-status">
-                    {move.isVerified ? '✅ Verified' : '🔒 Encrypted'}
+                  <div className="data-status">
+                    Status: {data.isVerified ? "✅ Verified" : "🔓 Needs Verification"}
                   </div>
+                  <div className="data-creator">Creator: {data.creator.substring(0, 6)}...{data.creator.substring(38)}</div>
                 </div>
               ))}
             </div>
           </div>
-        </div>
+        )}
+        
+        {activeTab === "history" && (
+          <div className="history-section">
+            <h2>Operation History</h2>
+            <div className="history-list">
+              {history.length === 0 ? (
+                <div className="no-history">
+                  <p>No operations recorded yet</p>
+                </div>
+              ) : history.map((item, index) => (
+                <div className="history-item" key={index}>
+                  <div className="history-icon">📝</div>
+                  <div className="history-content">{item}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        
+        {activeTab === "faq" && (
+          <div className="faq-section">
+            <h2>Frequently Asked Questions</h2>
+            <div className="faq-list">
+              <div className="faq-item">
+                <div className="faq-question" onClick={() => toggleFaq(0)}>
+                  What is FHE-based Blind Chess?
+                  <span className="faq-toggle">{faqOpen === 0 ? "−" : "+"}</span>
+                </div>
+                {faqOpen === 0 && (
+                  <div className="faq-answer">
+                    FHE-based Blind Chess is a chess variant where piece positions are encrypted using Fully Homomorphic Encryption (FHE). Players can verify move legality without revealing piece positions.
+                  </div>
+                )}
+              </div>
+              
+              <div className="faq-item">
+                <div className="faq-question" onClick={() => toggleFaq(1)}>
+                  How does homomorphic verification work?
+                  <span className="faq-toggle">{faqOpen === 1 ? "−" : "+"}</span>
+                </div>
+                {faqOpen === 1 && (
+                  <div className="faq-answer">
+                    Homomorphic encryption allows computations on encrypted data. When you move a piece, the system verifies the move's legality without decrypting the piece's position.
+                  </div>
+                )}
+              </div>
+              
+              <div className="faq-item">
+                <div className="faq-question" onClick={() => toggleFaq(2)}>
+                  Why is my piece position encrypted?
+                  <span className="faq-toggle">{faqOpen === 2 ? "−" : "+"}</span>
+                </div>
+                {faqOpen === 2 && (
+                  <div className="faq-answer">
+                    Encryption prevents your opponent from seeing your piece positions, creating true "blind" chess where strategy relies on deduction rather than direct observation.
+                  </div>
+                )}
+              </div>
+              
+              <div className="faq-item">
+                <div className="faq-question" onClick={() => toggleFaq(3)}>
+                  How do I verify a piece's position?
+                  <span className="faq-toggle">{faqOpen === 3 ? "−" : "+"}</span>
+                </div>
+                {faqOpen === 3 && (
+                  <div className="faq-answer">
+                    Select a piece and click "Verify Position". This will decrypt the position on-chain and update the board. Verification requires a blockchain transaction.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
-
-      {showMoveModal && (
-        <div className="modal-overlay">
-          <div className="move-modal">
-            <div className="modal-header">
-              <h2>Make Encrypted Move</h2>
-              <button onClick={() => setShowMoveModal(false)} className="close-modal">&times;</button>
-            </div>
-            <div className="modal-body">
-              <div className="form-group">
-                <label>From Position</label>
-                <input 
-                  type="text" 
-                  value={newMoveData.from}
-                  onChange={(e) => setNewMoveData({...newMoveData, from: e.target.value})}
-                  placeholder="e.g. e2"
-                />
-              </div>
-              <div className="form-group">
-                <label>To Position</label>
-                <input 
-                  type="text" 
-                  value={newMoveData.to}
-                  onChange={(e) => setNewMoveData({...newMoveData, to: e.target.value})}
-                  placeholder="e.g. e4"
-                />
-              </div>
-              <div className="form-group">
-                <label>Piece</label>
-                <select 
-                  value={newMoveData.piece}
-                  onChange={(e) => setNewMoveData({...newMoveData, piece: e.target.value})}
-                >
-                  <option value="pawn">Pawn</option>
-                  <option value="rook">Rook</option>
-                  <option value="knight">Knight</option>
-                  <option value="bishop">Bishop</option>
-                  <option value="queen">Queen</option>
-                  <option value="king">King</option>
-                </select>
-              </div>
-              <div className="fhe-notice">
-                <p>This move will be encrypted with FHE technology</p>
-              </div>
-            </div>
-            <div className="modal-footer">
-              <button onClick={() => setShowMoveModal(false)} className="cancel-btn">Cancel</button>
-              <button 
-                onClick={makeMove} 
-                disabled={makingMove || isEncrypting || !newMoveData.from || !newMoveData.to}
-                className="submit-btn"
-              >
-                {makingMove || isEncrypting ? "Encrypting..." : "Make Move"}
-              </button>
-            </div>
-          </div>
-        </div>
+      
+      {showCreateModal && (
+        <ModalCreatePiece 
+          onSubmit={createPiece} 
+          onClose={() => setShowCreateModal(false)} 
+          creating={creatingPiece} 
+          pieceData={newPieceData} 
+          setPieceData={setNewPieceData}
+          isEncrypting={isEncrypting}
+        />
       )}
-
-      {selectedMove && (
-        <div className="modal-overlay">
-          <div className="move-detail-modal">
-            <div className="modal-header">
-              <h2>Move Details</h2>
-              <button onClick={() => setSelectedMove(null)} className="close-modal">&times;</button>
-            </div>
-            <div className="modal-body">
-              <div className="move-info">
-                <div className="info-row">
-                  <span>From:</span>
-                  <strong>{selectedMove.from}</strong>
-                </div>
-                <div className="info-row">
-                  <span>To:</span>
-                  <strong>{selectedMove.to}</strong>
-                </div>
-                <div className="info-row">
-                  <span>Creator:</span>
-                  <strong>{selectedMove.creator.substring(0, 6)}...{selectedMove.creator.substring(38)}</strong>
-                </div>
-                <div className="info-row">
-                  <span>Time:</span>
-                  <strong>{new Date(selectedMove.timestamp * 1000).toLocaleString()}</strong>
-                </div>
-                <div className="info-row">
-                  <span>Status:</span>
-                  <strong>{selectedMove.isVerified ? 'Verified' : 'Encrypted'}</strong>
-                </div>
-              </div>
-              <div className="move-actions">
-                <button 
-                  onClick={async () => {
-                    const decrypted = await decryptMove(selectedMove.id);
-                    if (decrypted !== null) {
-                      setSelectedMove({...selectedMove, isVerified: true, decryptedValue: decrypted});
-                    }
-                  }}
-                  disabled={isDecrypting || selectedMove.isVerified}
-                  className="decrypt-btn"
-                >
-                  {isDecrypting ? 'Decrypting...' : selectedMove.isVerified ? 'Already Verified' : 'Verify Move'}
-                </button>
-              </div>
-              {selectedMove.isVerified && (
-                <div className="decrypted-info">
-                  <h3>Decrypted Move Value</h3>
-                  <div className="decrypted-value">{selectedMove.decryptedValue}</div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+      
+      {selectedPiece && (
+        <PieceDetailModal 
+          piece={selectedPiece} 
+          onClose={() => { 
+            setSelectedPiece(null); 
+            setDecryptedPosition(null); 
+          }} 
+          decryptedPosition={decryptedPosition} 
+          isDecrypting={isDecrypting || fheIsDecrypting} 
+          decryptData={() => decryptData(selectedPiece.id)}
+          renderDataChart={renderDataChart}
+        />
       )}
-
+      
       {transactionStatus.visible && (
         <div className="transaction-modal">
           <div className="transaction-content">
@@ -541,6 +639,180 @@ const App: React.FC = () => {
           </div>
         </div>
       )}
+      
+      <footer className="app-footer">
+        <div className="footer-section">
+          <h4>About FHE Blind Chess</h4>
+          <p>Privacy-preserving chess using Fully Homomorphic Encryption</p>
+        </div>
+        <div className="footer-section">
+          <h4>Technology</h4>
+          <p>Powered by Zama FHE & Ethereum</p>
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+const ModalCreatePiece: React.FC<{
+  onSubmit: () => void; 
+  onClose: () => void; 
+  creating: boolean;
+  pieceData: any;
+  setPieceData: (data: any) => void;
+  isEncrypting: boolean;
+}> = ({ onSubmit, onClose, creating, pieceData, setPieceData, isEncrypting }) => {
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setPieceData({ ...pieceData, [name]: value });
+  };
+
+  return (
+    <div className="modal-overlay">
+      <div className="create-piece-modal">
+        <div className="modal-header">
+          <h2>New Chess Piece</h2>
+          <button onClick={onClose} className="close-modal">&times;</button>
+        </div>
+        
+        <div className="modal-body">
+          <div className="fhe-notice">
+            <strong>FHE 🔐 Encryption</strong>
+            <p>Piece position will be encrypted with FHE (Integer only)</p>
+          </div>
+          
+          <div className="form-group">
+            <label>Piece Name *</label>
+            <input 
+              type="text" 
+              name="name" 
+              value={pieceData.name} 
+              onChange={handleChange} 
+              placeholder="Enter piece name..." 
+            />
+          </div>
+          
+          <div className="form-group">
+            <label>Board Position (0-63) *</label>
+            <input 
+              type="number" 
+              name="position" 
+              value={pieceData.position} 
+              onChange={handleChange} 
+              placeholder="Enter position..." 
+              min="0"
+              max="63"
+            />
+            <div className="data-type-label">FHE Encrypted Integer</div>
+          </div>
+          
+          <div className="form-group">
+            <label>Description</label>
+            <input 
+              type="text" 
+              name="description" 
+              value={pieceData.description} 
+              onChange={handleChange} 
+              placeholder="Enter description..." 
+            />
+          </div>
+        </div>
+        
+        <div className="modal-footer">
+          <button onClick={onClose} className="cancel-btn">Cancel</button>
+          <button 
+            onClick={onSubmit} 
+            disabled={creating || isEncrypting || !pieceData.name || !pieceData.position} 
+            className="submit-btn"
+          >
+            {creating || isEncrypting ? "Encrypting..." : "Create Piece"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const PieceDetailModal: React.FC<{
+  piece: ChessData;
+  onClose: () => void;
+  decryptedPosition: number | null;
+  isDecrypting: boolean;
+  decryptData: () => Promise<number | null>;
+  renderDataChart: (data: ChessData) => JSX.Element;
+}> = ({ piece, onClose, decryptedPosition, isDecrypting, decryptData, renderDataChart }) => {
+  const handleDecrypt = async () => {
+    if (piece.isVerified) return;
+    await decryptData();
+  };
+
+  return (
+    <div className="modal-overlay">
+      <div className="piece-detail-modal">
+        <div className="modal-header">
+          <h2>Chess Piece Details</h2>
+          <button onClick={onClose} className="close-modal">&times;</button>
+        </div>
+        
+        <div className="modal-body">
+          <div className="piece-info">
+            <div className="info-item">
+              <span>Piece Name:</span>
+              <strong>{piece.name}</strong>
+            </div>
+            <div className="info-item">
+              <span>Creator:</span>
+              <strong>{piece.creator.substring(0, 6)}...{piece.creator.substring(38)}</strong>
+            </div>
+            <div className="info-item">
+              <span>Date Created:</span>
+              <strong>{new Date(piece.timestamp * 1000).toLocaleDateString()}</strong>
+            </div>
+          </div>
+          
+          <div className="data-section">
+            <h3>Encrypted Position Data</h3>
+            
+            <div className="data-row">
+              <div className="data-label">Board Position:</div>
+              <div className="data-value">
+                {piece.isVerified ? 
+                  `${piece.decryptedValue} (Verified)` : 
+                  decryptedPosition !== null ? 
+                  `${decryptedPosition} (Decrypted)` : 
+                  "🔒 Encrypted"
+                }
+              </div>
+              <button 
+                className={`decrypt-btn ${piece.isVerified ? 'verified' : ''}`}
+                onClick={handleDecrypt} 
+                disabled={isDecrypting || piece.isVerified}
+              >
+                {isDecrypting ? "Decrypting..." : piece.isVerified ? "✅ Verified" : "🔓 Decrypt Position"}
+              </button>
+            </div>
+            
+            <div className="fhe-info">
+              <div className="fhe-icon">🔐</div>
+              <div>
+                <strong>FHE Position Encryption</strong>
+                <p>Piece position is encrypted on-chain. Decrypt to reveal actual board position.</p>
+              </div>
+            </div>
+          </div>
+          
+          {(piece.isVerified || decryptedPosition !== null) && (
+            <div className="analysis-section">
+              <h3>Position Analysis</h3>
+              {renderDataChart(piece)}
+            </div>
+          )}
+        </div>
+        
+        <div className="modal-footer">
+          <button onClick={onClose} className="close-btn">Close</button>
+        </div>
+      </div>
     </div>
   );
 };
